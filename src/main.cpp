@@ -20,6 +20,7 @@ using seed_t = std::mt19937_64::result_type;
 
 enum class IOType {
 	RandRead,
+	Read,
 	Write,
 };
 
@@ -110,6 +111,20 @@ public:
 				offset += ret;
 			} while (n);
 			} break;
+		case IOType::Read: {
+			char *buf = aligned_buf_;
+			size_t n = options_.bs;
+			do {
+				ssize_t ret = read(fd_, buf, n);
+				if (ret == -1 || ret == 0) {
+					perror("read");
+					rusty_panic();
+				}
+				assert(ret > 0);
+				buf += ret;
+				n -= ret;
+			} while (n);
+		} break;
 		case IOType::Write: {
 			char *buf = aligned_buf_;
 			size_t n = options_.bs;
@@ -153,7 +168,7 @@ int main(int argc, char **argv) {
 	);
 	desc.add_options()(
 		"readwrite", po::value<std::string>(&readwrite)->required(),
-		"randread/write"
+		"randread/read/write"
 	);
 	desc.add_options()("randseed", po::value<seed_t>());
 	desc.add_options()("size", po::value<std::string>(&arg_size)->required());
@@ -201,6 +216,8 @@ int main(int argc, char **argv) {
 	IOType io_type;
 	if (readwrite == "randread") {
 		io_type = IOType::RandRead;
+	} else if (readwrite == "read") {
+		io_type = IOType::Read;
 	} else if (readwrite == "write") {
 		io_type = IOType::Write;
 	} else {
@@ -245,6 +262,22 @@ int main(int argc, char **argv) {
 	int fd;
 	switch (io_type) {
 	case IOType::RandRead:
+	case IOType::Read:
+		if (fstat.st_size < size) {
+			std::cout << "Target file too small, rewriting...";
+			fd = open(
+				filename.c_str(), O_DIRECT | O_WRONLY | O_CREAT | O_TRUNC,
+				S_IRUSR | S_IWUSR
+			);
+			Worker worker(options, fd, rng());
+			size_t num_op = num_blocks;
+			while (num_op) {
+				num_op -= 1;
+				worker.rw_one_block(IOType::Write);
+			}
+			close(fd);
+			std::cout << " done" << std::endl;
+		}
 		fd = open(filename.c_str(), O_DIRECT | O_RDONLY);
 		break;
 	case IOType::Write:
