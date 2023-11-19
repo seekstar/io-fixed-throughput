@@ -92,8 +92,10 @@ public:
 			((uintptr_t)buf_.data() + options_.blksize - 1) &
 				~(uintptr_t)(options_.blksize - 1)
 		)),
-		block_dist(0, options_.num_blocks - 1) {}
+		block_dist(0, options_.num_blocks - 1),
+		io_time_(rusty::time::Duration::from_nanos(0)) {}
 	void rw_one_block(IOType io_type) {
+		auto start = rusty::time::Instant::now();
 		switch (io_type) {
 		case IOType::RandRead: {
 			char *buf = aligned_buf_;
@@ -140,7 +142,9 @@ public:
 			} while (n);
 			} break;
 		}
+		io_time_ += start.elapsed();
 	}
+	rusty::time::Duration io_time() const { return io_time_; }
 
 private:
 	const Options &options_;
@@ -150,6 +154,7 @@ private:
 	std::vector<char> buf_;
 	char *aligned_buf_;
 	std::uniform_int_distribution<size_t> block_dist;
+	rusty::time::Duration io_time_;
 };
 
 int main(int argc, char **argv) {
@@ -322,6 +327,7 @@ int main(int argc, char **argv) {
 	}
 	double seconds = start.elapsed().as_secs_double();
 	std::cout << "Throughput " << size / seconds / 1e6 << "MB/s" << std::endl;
+	std::cout << "Average latency " << worker.io_time().as_nanos() / num_blocks << " ns" << std::endl;
 
 	return 0;
 }
