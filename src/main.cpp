@@ -108,9 +108,11 @@ public:
 			size_t num_op = options_.num_blocks;
 			while (num_op) {
 				num_op -= 1;
-				rw_one_block(options_.io_type);
+				rw_one_block();
 				std::optional<rusty::time::Duration> sleep_time =
-					next_begin.checked_duration_since(rusty::time::Instant::now());
+					next_begin.checked_duration_since(
+						rusty::time::Instant::now()
+					);
 				if (sleep_time.has_value()) {
 					std::this_thread::sleep_for(
 						std::chrono::nanoseconds(sleep_time.value().as_nanos())
@@ -122,7 +124,7 @@ public:
 			size_t num_op = options_.num_blocks;
 			while (num_op) {
 				num_op -= 1;
-				rw_one_block(options_.io_type);
+				rw_one_block();
 			}
 		}
 		run_time_ += start.elapsed();
@@ -131,9 +133,9 @@ public:
 	rusty::time::Duration run_time() const { return run_time_; }
 
 private:
-	void rw_one_block(IOType io_type) {
+	void rw_one_block() {
 		auto start = rusty::time::Instant::now();
-		switch (io_type) {
+		switch (options_.io_type) {
 		case IOType::RandRead: {
 			char *buf = aligned_buf_;
 			size_t offset = block_dist(rng_) * options_.bs;
@@ -149,7 +151,7 @@ private:
 				n -= ret;
 				offset += ret;
 			} while (n);
-			} break;
+		} break;
 		case IOType::Read: {
 			char *buf = aligned_buf_;
 			size_t n = options_.bs;
@@ -177,7 +179,7 @@ private:
 				buf += ret;
 				n -= ret;
 			} while (n);
-			} break;
+		} break;
 		}
 		io_time_ += start.elapsed();
 	}
@@ -308,33 +310,57 @@ int main(int argc, char **argv) {
 		return 0;
 	}
 
-	struct stat fstat;
-	stat(filename.c_str(), &fstat);
-	Options options {
-		.blksize = static_cast<size_t>(fstat.st_blksize),
-		.bandwidth = bandwidth,
-		.bs = bs,
-		.io_type = io_type,
-		.num_blocks = num_blocks,
-	};
-
 	int fd;
 	switch (io_type) {
 	case IOType::RandRead:
 	case IOType::Read:
-		if (fstat.st_size < size) {
-			std::cout << "Target file too small, rewriting...";
+		for (;;) {
+			fd = open(filename.c_str(), O_DIRECT | O_RDONLY);
+			if (fd == -1) {
+				if (errno != ENOENT) {
+					perror("open");
+					rusty_panic();
+				}
+				std::cout << "Target file does not exists, writing...";
+			} else {
+				rusty_assert(fd >= 0);
+				struct stat file_stat;
+				if (fstat(fd, &file_stat) == -1) {
+					perror("fstat");
+					rusty_panic();
+				}
+				if (file_stat.st_size >= size) {
+					break;
+				}
+				std::cout << "Target file too small, rewriting...";
+			}
+			std::cout.flush();
 			fd = open(
 				filename.c_str(), O_DIRECT | O_WRONLY | O_CREAT | O_TRUNC,
 				S_IRUSR | S_IWUSR
 			);
-			Options tmp = options;
-			tmp.io_type = IOType::Write;
-			Worker(options, fd, rng()).run();
-			close(fd);
+			if (fd == -1) {
+				perror("open");
+				rusty_panic();
+			}
+			struct stat file_stat;
+			if (fstat(fd, &file_stat) == -1) {
+				perror("fstat");
+				rusty_panic();
+			}
+			Worker(
+				Options{
+					.blksize = static_cast<size_t>(file_stat.st_blksize),
+					.bandwidth = std::nullopt,
+					.bs = bs,
+					.io_type = IOType::Write,
+					.num_blocks = num_blocks,
+				},
+				fd, rng()
+			).run();
+			rusty_assert(close(fd) == 0);
 			std::cout << " done" << std::endl;
 		}
-		fd = open(filename.c_str(), O_DIRECT | O_RDONLY);
 		break;
 	case IOType::Write:
 		if (numjobs > 1) {
@@ -352,6 +378,19 @@ int main(int argc, char **argv) {
 		rusty_panic();
 	}
 
+	struct stat file_stat;
+	if (fstat(fd, &file_stat) == -1) {
+		perror("fstat");
+		rusty_panic();
+	}
+	Options options {
+		.blksize = static_cast<size_t>(file_stat.st_blksize),
+		.bandwidth = bandwidth,
+		.bs = bs,
+		.io_type = io_type,
+		.num_blocks = num_blocks,
+	};
+
 	std::vector<Worker> workers;
 	workers.reserve(numjobs);
 	std::vector<std::thread> threads;
@@ -366,7 +405,7 @@ int main(int argc, char **argv) {
 		threads[i].join();
 	}
 	auto run_time = run_start.elapsed();
-	if (group_reporting) {
+	if (numjobs > 1 && group_reporting) {
 		auto io_time = rusty::time::Duration::from_nanos(0);
 		for (size_t i = 0; i < numjobs; ++i) {
 			io_time += workers[i].io_time();
@@ -377,7 +416,10 @@ int main(int argc, char **argv) {
 			<< "ns" << std::endl;
 	} else {
 		for (size_t i = 0; i < numjobs; ++i) {
-			std::cout << i << ": throughput "
+			if (numjobs > 1) {
+				std::cout << i << ": ";
+			}
+			std::cout << "throughput "
 				<< size / workers[i].run_time().as_secs_double() / 1e6
 				<< "MB/s, avg latency "
 				<< workers[i].io_time().as_nanos() / num_blocks << "ns"
