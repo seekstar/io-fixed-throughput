@@ -77,7 +77,9 @@ struct Options {
 	// Allocated buffer should align to blksize
 	size_t blksize;
 
+	std::optional<size_t> bandwidth;
 	size_t bs;
+	IOType io_type;
 	size_t num_blocks;
 };
 
@@ -93,7 +95,42 @@ public:
 				~(uintptr_t)(options_.blksize - 1)
 		)),
 		block_dist(0, options_.num_blocks - 1),
-		io_time_(rusty::time::Duration::from_nanos(0)) {}
+		io_time_(rusty::time::Duration::from_nanos(0)),
+		run_time_(rusty::time::Duration::from_nanos(0)) {}
+	void run() {
+		rusty::time::Instant start = rusty::time::Instant::now();
+		if (options_.bandwidth.has_value()) {
+			rusty::time::Duration interval = rusty::time::Duration::from_nanos(
+				options_.bs * 1e9 / options_.bandwidth.value()
+			);
+			rusty::time::Instant next_begin =
+				rusty::time::Instant::now() + interval;
+			size_t num_op = options_.num_blocks;
+			while (num_op) {
+				num_op -= 1;
+				rw_one_block(options_.io_type);
+				std::optional<rusty::time::Duration> sleep_time =
+					next_begin.checked_duration_since(rusty::time::Instant::now());
+				if (sleep_time.has_value()) {
+					std::this_thread::sleep_for(
+						std::chrono::nanoseconds(sleep_time.value().as_nanos())
+					);
+				}
+				next_begin += interval;
+			}
+		} else {
+			size_t num_op = options_.num_blocks;
+			while (num_op) {
+				num_op -= 1;
+				rw_one_block(options_.io_type);
+			}
+		}
+		run_time_ += start.elapsed();
+	}
+	rusty::time::Duration io_time() const { return io_time_; }
+	rusty::time::Duration run_time() const { return run_time_; }
+
+private:
 	void rw_one_block(IOType io_type) {
 		auto start = rusty::time::Instant::now();
 		switch (io_type) {
@@ -144,9 +181,7 @@ public:
 		}
 		io_time_ += start.elapsed();
 	}
-	rusty::time::Duration io_time() const { return io_time_; }
 
-private:
 	const Options &options_;
 	int fd_;
 
@@ -155,11 +190,13 @@ private:
 	char *aligned_buf_;
 	std::uniform_int_distribution<size_t> block_dist;
 	rusty::time::Duration io_time_;
+	rusty::time::Duration run_time_;
 };
 
 int main(int argc, char **argv) {
 	std::string arg_bs;
 	std::string filename;
+	size_t numjobs;
 	std::string readwrite;
 	std::string arg_size;
 
@@ -170,6 +207,14 @@ int main(int argc, char **argv) {
 	desc.add_options()("bs", po::value<std::string>(&arg_bs)->required());
 	desc.add_options()(
 		"filename", po::value<std::string>(&filename)->required()
+	);
+	desc.add_options()(
+		"group_reporting",
+		"Display statistics for groups of jobs as a whole "
+			"instead of for each individual job"
+	);
+	desc.add_options()(
+		"numjobs", po::value<size_t>(&numjobs)->default_value(1)
 	);
 	desc.add_options()(
 		"readwrite", po::value<std::string>(&readwrite)->required(),
@@ -218,6 +263,13 @@ int main(int argc, char **argv) {
 		std::cout << "bs: " << bs << 'B' << std::endl;
 	}
 
+	bool group_reporting;
+	if (vm.count("group_reporting")) {
+		group_reporting = true;
+	} else {
+		group_reporting = false;
+	}
+
 	IOType io_type;
 	if (readwrite == "randread") {
 		io_type = IOType::RandRead;
@@ -260,7 +312,9 @@ int main(int argc, char **argv) {
 	stat(filename.c_str(), &fstat);
 	Options options {
 		.blksize = static_cast<size_t>(fstat.st_blksize),
+		.bandwidth = bandwidth,
 		.bs = bs,
+		.io_type = io_type,
 		.num_blocks = num_blocks,
 	};
 
@@ -274,18 +328,19 @@ int main(int argc, char **argv) {
 				filename.c_str(), O_DIRECT | O_WRONLY | O_CREAT | O_TRUNC,
 				S_IRUSR | S_IWUSR
 			);
-			Worker worker(options, fd, rng());
-			size_t num_op = num_blocks;
-			while (num_op) {
-				num_op -= 1;
-				worker.rw_one_block(IOType::Write);
-			}
+			Options tmp = options;
+			tmp.io_type = IOType::Write;
+			Worker(options, fd, rng()).run();
 			close(fd);
 			std::cout << " done" << std::endl;
 		}
 		fd = open(filename.c_str(), O_DIRECT | O_RDONLY);
 		break;
 	case IOType::Write:
+		if (numjobs > 1) {
+			std::cerr << "Multithread write is not supported yet." << std::endl;
+			return 1;
+		}
 		fd = open(
 			filename.c_str(), O_DIRECT | O_WRONLY | O_CREAT | O_TRUNC,
 			S_IRUSR | S_IWUSR
@@ -297,37 +352,38 @@ int main(int argc, char **argv) {
 		rusty_panic();
 	}
 
-	Worker worker(options, fd, rng());
-	rusty::time::Instant start = rusty::time::Instant::now();
-	if (bandwidth.has_value()) {
-		rusty::time::Duration interval = rusty::time::Duration::from_nanos(
-			bs * 1e9 / bandwidth.value()
-		);
-		rusty::time::Instant next_begin =
-			rusty::time::Instant::now() + interval;
-		size_t num_op = num_blocks;
-		while (num_op) {
-			num_op -= 1;
-			worker.rw_one_block(io_type);
-			std::optional<rusty::time::Duration> sleep_time =
-				next_begin.checked_duration_since(rusty::time::Instant::now());
-			if (sleep_time.has_value()) {
-				std::this_thread::sleep_for(
-					std::chrono::nanoseconds(sleep_time.value().as_nanos())
-				);
-			}
-			next_begin += interval;
+	std::vector<Worker> workers;
+	workers.reserve(numjobs);
+	std::vector<std::thread> threads;
+	for (size_t i = 0; i < numjobs; ++i) {
+		workers.emplace_back(options, fd, rng());
+	}
+	auto run_start = rusty::time::Instant::now();
+	for (size_t i = 0; i < numjobs; ++i) {
+		threads.emplace_back([&workers, i] { workers[i].run(); });
+	}
+	for (size_t i = 0; i < numjobs; ++i) {
+		threads[i].join();
+	}
+	auto run_time = run_start.elapsed();
+	if (group_reporting) {
+		auto io_time = rusty::time::Duration::from_nanos(0);
+		for (size_t i = 0; i < numjobs; ++i) {
+			io_time += workers[i].io_time();
 		}
+		std::cout << "Throughput "
+			<< size * numjobs / run_time.as_secs_double() / 1e6
+			<< "MB/s, avg latency " << io_time.as_nanos() / (num_blocks * numjobs)
+			<< "ns" << std::endl;
 	} else {
-		size_t num_op = num_blocks;
-		while (num_op) {
-			num_op -= 1;
-			worker.rw_one_block(io_type);
+		for (size_t i = 0; i < numjobs; ++i) {
+			std::cout << i << ": throughput "
+				<< size / workers[i].run_time().as_secs_double() / 1e6
+				<< "MB/s, avg latency "
+				<< workers[i].io_time().as_nanos() / num_blocks << "ns"
+				<< std::endl;
 		}
 	}
-	double seconds = start.elapsed().as_secs_double();
-	std::cout << "Throughput " << size / seconds / 1e6 << "MB/s" << std::endl;
-	std::cout << "Average latency " << worker.io_time().as_nanos() / num_blocks << " ns" << std::endl;
 
 	return 0;
 }
