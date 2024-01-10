@@ -12,9 +12,9 @@
 #include <rusty/time.h>
 #include <thread>
 
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 
 using seed_t = std::mt19937_64::result_type;
 
@@ -128,6 +128,14 @@ public:
 			}
 		}
 		run_time_ += start.elapsed();
+	}
+	void pwrite(size_t offset, size_t n) {
+		char *buf = aligned_buf_;
+		ssize_t ret = ::pwrite(fd_, buf, n, offset);
+		if (ret == -1 || ret == 0) {
+			perror("pwrite");
+			rusty_panic();
+		}
 	}
 	rusty::time::Duration io_time() const { return io_time_; }
 	rusty::time::Duration run_time() const { return run_time_; }
@@ -348,16 +356,23 @@ int main(int argc, char **argv) {
 				perror("fstat");
 				rusty_panic();
 			}
-			Worker(
+			size_t write_bs = std::min(size, (size_t)1 << 20);
+			size_t write_blocks = size / write_bs;
+			size_t remain = size % write_bs;
+			Worker worker(
 				Options{
 					.blksize = static_cast<size_t>(file_stat.st_blksize),
 					.bandwidth = std::nullopt,
-					.bs = bs,
+					.bs = write_bs,
 					.io_type = IOType::Write,
-					.num_blocks = num_blocks,
+					.num_blocks = size / write_bs,
 				},
 				fd, rng()
-			).run();
+			);
+			worker.run();
+			if (remain != 0) {
+				worker.pwrite(size - remain, remain);
+			}
 			rusty_assert(close(fd) == 0);
 			std::cout << " done" << std::endl;
 		}
