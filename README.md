@@ -14,7 +14,7 @@ conan profile detect
 Add my conan server to remote:
 
 ```shell
-conan remote add seekstar http://nuc.seekstar.top:9300
+conan remote add seekstar http://c.seekstar.top:9300
 ```
 
 Then build:
